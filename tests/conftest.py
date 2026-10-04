@@ -61,6 +61,10 @@ requires_cuda_backend = pytest.mark.skipif(
     not cuda_backend_available(), reason="compiled CUDA backend required"
 )
 
+requires_mps = pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="MPS device required"
+)
+
 
 @pytest.fixture(scope="session")
 def cuda_available():

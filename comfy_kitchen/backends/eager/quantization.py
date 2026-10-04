@@ -747,9 +747,35 @@ def _round_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+# MPS int8 GEMM: aten::_int_mm has no MPS kernel (pytorch/pytorch#141287), so
+# multiply in fp32. An int8 product is exact in fp32 (|a*b| <= 2**14) and a
+# partial sum stays exact while it is below 2**24, the largest integer fp32
+# represents. _MPS_INT8_MM_K_CHUNK * 2**14 == 2**23 keeps every chunk sum
+# inside that bound; the chunk results convert to INT32 and accumulate there,
+# where they stay exact. The result is the exact INT32 dot product the
+# CPU/CUDA/HIP paths return. A single fp32 GEMM is not: once dot products pass
+# 2**24 (biased int8 inputs reach that by K=1024), fp32 rounding lands units
+# away from the true INT32 value.
+_MPS_INT8_MM_K_CHUNK = 512
+
+
+def _mps_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    """Exact INT8 matmul on MPS: fp32 chunk products, INT32 accumulation."""
+    acc = torch.zeros((lhs.size(0), rhs.size(1)), dtype=torch.int32, device=lhs.device)
+    for start in range(0, lhs.size(1), _MPS_INT8_MM_K_CHUNK):
+        chunk = torch.mm(
+            lhs[:, start : start + _MPS_INT8_MM_K_CHUNK].float(),
+            rhs[start : start + _MPS_INT8_MM_K_CHUNK, :].float(),
+        )
+        acc += chunk.to(torch.int32)
+    return acc
+
+
 def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Multiply INT8 matrices and return INT32 accumulators."""
     def fast_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        if lhs.is_mps:
+            return _mps_int8_mm(lhs, rhs)
         if hasattr(torch, "int8_mm"):
             return torch.int8_mm(lhs, rhs)
         return torch._int_mm(lhs, rhs)
@@ -786,7 +812,9 @@ def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N].
 
-    Uses torch._int_mm (cuBLASLt on CUDA). Output is int32.
+    Uses torch._int_mm (cuBLASLt on CUDA). On MPS, where aten::_int_mm has no
+    kernel, fp32 chunk products accumulate in INT32 for the same exact result.
+    Output is int32.
 
     Args:
         a: INT8 tensor [M, K].
