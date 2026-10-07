@@ -747,9 +747,62 @@ def _round_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+# MPS int8 GEMM: aten::_int_mm has no MPS kernel (pytorch/pytorch#141287), so
+# multiply in fp32. An int8 product is exact in fp32 (|a*b| <= 2**14) and a
+# partial sum stays exact while its magnitude is at most 2**24, the largest
+# integer fp32 represents. _MPS_INT8_MM_K_CHUNK * 2**14 == 2**24 puts every
+# chunk sum at that bound: each partial sum is an integer within +/-2**24,
+# all of which fp32 represents exactly, in any reduction order. Chunk results
+# convert to INT32 and accumulate there, where they stay exact, so the result
+# is the exact INT32 dot product the CPU/CUDA/HIP paths return. The chunk is
+# the largest that works: 2048-wide chunks measured 80+ units off. A single
+# fp32 GEMM is also not exact: once dot products pass 2**24 (biased int8
+# inputs reach that by K=1024), fp32 rounding lands units away from the true
+# INT32 value.
+_MPS_INT8_MM_K_CHUNK = 1024
+
+# Cap the fp32 workspace a call may hold: the chunk copies of both operands
+# plus their [M, N] products. Batching all chunks at once would pin multiples
+# of the output matrix in unified memory and OOM low-RAM Macs, so chunks that
+# do not fit run in later batches and sum in INT32 across them, which stays
+# exact.
+_MPS_INT8_MM_FP32_BUDGET_BYTES = 256 * 2**20
+
+
+def _mps_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    """Exact INT8 matmul on MPS: batched fp32 chunk products, INT32 accumulation."""
+    m, k = lhs.shape
+    n = rhs.size(1)
+    if m == 0 or n == 0:
+        return torch.zeros((m, n), dtype=torch.int32, device=lhs.device)
+
+    chunk = _MPS_INT8_MM_K_CHUNK
+    n_chunks = (k + chunk - 1) // chunk
+    pad = n_chunks * chunk - k
+    if pad:
+        lhs = torch.cat((lhs, torch.zeros((m, pad), dtype=torch.int8, device=lhs.device)), dim=1)
+        rhs = torch.cat((rhs, torch.zeros((pad, n), dtype=torch.int8, device=rhs.device)), dim=0)
+
+    per_batch_bytes = 4 * (m * n + chunk * (m + n))
+    max_batch = max(1, _MPS_INT8_MM_FP32_BUDGET_BYTES // per_batch_bytes)
+
+    acc = torch.zeros((m, n), dtype=torch.int32, device=lhs.device)
+    for first in range(0, n_chunks, max_batch):
+        last = min(first + max_batch, n_chunks)
+        batch = last - first
+        a_batch = (
+            lhs[:, first * chunk : last * chunk].reshape(m, batch, chunk).permute(1, 0, 2).float()
+        )
+        b_batch = rhs[first * chunk : last * chunk, :].reshape(batch, chunk, n).float()
+        acc += torch.bmm(a_batch, b_batch).to(torch.int32).sum(0)
+    return acc
+
+
 def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Multiply INT8 matrices and return INT32 accumulators."""
     def fast_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        if lhs.is_mps:
+            return _mps_int8_mm(lhs, rhs)
         if hasattr(torch, "int8_mm"):
             return torch.int8_mm(lhs, rhs)
         return torch._int_mm(lhs, rhs)
@@ -786,7 +839,9 @@ def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N].
 
-    Uses torch._int_mm (cuBLASLt on CUDA). Output is int32.
+    Uses torch._int_mm (cuBLASLt on CUDA). On MPS, where aten::_int_mm has no
+    kernel, fp32 chunk products accumulate in INT32 for the same exact result.
+    Output is int32.
 
     Args:
         a: INT8 tensor [M, K].
